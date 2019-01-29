@@ -1262,8 +1262,8 @@ fail:
 		 * search normally.
 		 */
 		debug("No matching CA found. Retry with plain key");
-		if ((r = sshkey_from_private(host_key, &raw_key)) != 0)
-			fatal("%s: sshkey_from_private: %s",
+		if ((r = sshkey_copy_public(host_key, &raw_key)) != 0)
+			fatal("%s: sshkey_copy_public: %s",
 			    __func__, ssh_err(r));
 		if ((r = sshkey_drop_cert(raw_key)) != 0)
 			fatal("Couldn't drop certificate: %s", ssh_err(r));
@@ -1354,7 +1354,7 @@ verify_host_key(char *host, struct sockaddr *hostaddr, struct sshkey *host_key)
 		 * XXX certs are not yet supported for DNS, so downgrade
 		 * them and try the plain key.
 		 */
-		if ((r = sshkey_from_private(host_key, &plain)) != 0)
+		if ((r = sshkey_copy_public(host_key, &plain)) != 0)
 			goto out;
 		if (sshkey_is_cert(plain))
 			sshkey_drop_cert(plain);
@@ -1387,7 +1387,7 @@ out:
 	free(cafp);
 	if (r == 0 && host_key != NULL) {
 		sshkey_free(previous_host_key);
-		r = sshkey_from_private(host_key, &previous_host_key);
+		r = sshkey_copy_public(host_key, &previous_host_key);
 	}
 
 	return r;

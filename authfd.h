@@ -31,6 +31,7 @@ int	ssh_fetch_identitylist(int sock, struct ssh_identitylist **idlp);
 void	ssh_free_identitylist(struct ssh_identitylist *idl);
 int	ssh_add_identity_constrained(int sock, const struct sshkey *key,
 	    const char *comment, u_int life, u_int confirm, u_int maxsign);
+int	ssh_add_certificate(int sock, const struct sshkey *key);
 int	ssh_remove_identity(int sock, struct sshkey *key);
 int	ssh_update_card(int sock, int add, const char *reader_id,
 	    const char *pin, u_int life, u_int confirm);
@@ -72,6 +73,9 @@ int	ssh_agent_sign(int sock, const struct sshkey *key,
 #define SSH_AGENTC_ADD_RSA_ID_CONSTRAINED	24
 #define SSH2_AGENTC_ADD_ID_CONSTRAINED		25
 #define SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED 26
+
+/* certificates */
+#define SSH2_AGENTC_ADD_CERTIFICATES		27
 
 #define	SSH_AGENT_CONSTRAIN_LIFETIME		1
 #define	SSH_AGENT_CONSTRAIN_CONFIRM		2

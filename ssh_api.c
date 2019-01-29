@@ -182,7 +182,7 @@ ssh_add_hostkey(struct ssh *ssh, struct sshkey *key)
 	int r;
 
 	if (ssh->kex->server) {
-		if ((r = sshkey_from_private(key, &pubkey)) != 0)
+		if ((r = sshkey_copy_public(key, &pubkey)) != 0)
 			return r;
 		if ((k = malloc(sizeof(*k))) == NULL ||
 		    (k_prv = malloc(sizeof(*k_prv))) == NULL) {

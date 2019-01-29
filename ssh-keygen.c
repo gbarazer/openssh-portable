@@ -1069,8 +1069,8 @@ do_gen_all_hostkeys(struct passwd *pw)
 			error("sshkey_generate failed: %s", ssh_err(r));
 			goto failnext;
 		}
-		if ((r = sshkey_from_private(private, &public)) != 0)
-			fatal("sshkey_from_private failed: %s", ssh_err(r));
+		if ((r = sshkey_copy_public(private, &public)) != 0)
+			fatal("sshkey_copy_public failed: %s", ssh_err(r));
 		snprintf(comment, sizeof comment, "%s@%s", pw->pw_name,
 		    hostname);
 		if ((r = sshkey_save_private(private, prv_tmp, "",
@@ -1536,8 +1536,8 @@ do_change_comment(struct passwd *pw)
 	}
 	explicit_bzero(passphrase, strlen(passphrase));
 	free(passphrase);
-	if ((r = sshkey_from_private(private, &public)) != 0)
-		fatal("sshkey_from_private failed: %s", ssh_err(r));
+	if ((r = sshkey_copy_public(private, &public)) != 0)
+		fatal("sshkey_copy_public failed: %s", ssh_err(r));
 	sshkey_free(private);
 
 	strlcat(identity_file, ".pub", sizeof(identity_file));
@@ -1767,9 +1767,9 @@ do_ca_sign(struct passwd *pw, int argc, char **argv)
 		prepare_options_buf(public->cert->critical, OPTIONS_CRITICAL);
 		prepare_options_buf(public->cert->extensions,
 		    OPTIONS_EXTENSIONS);
-		if ((r = sshkey_from_private(ca,
+		if ((r = sshkey_copy_public(ca,
 		    &public->cert->signature_key)) != 0)
-			fatal("sshkey_from_private (ca key): %s", ssh_err(r));
+			fatal("sshkey_copy_public (ca key): %s", ssh_err(r));
 
 		if (agent_fd != -1 && (ca->flags & SSHKEY_FLAG_EXT) != 0) {
 			if ((r = sshkey_certify_custom(public, ca,
@@ -2824,8 +2824,8 @@ main(int argc, char **argv)
 		    key_type_name);
 	if ((r = sshkey_generate(type, bits, &private)) != 0)
 		fatal("sshkey_generate failed");
-	if ((r = sshkey_from_private(private, &public)) != 0)
-		fatal("sshkey_from_private failed: %s\n", ssh_err(r));
+	if ((r = sshkey_copy_public(private, &public)) != 0)
+		fatal("sshkey_copy_public failed: %s\n", ssh_err(r));
 
 	if (!have_identity)
 		ask_filename(pw, "Enter file in which to save the key");

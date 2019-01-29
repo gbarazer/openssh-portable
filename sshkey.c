@@ -1684,7 +1684,7 @@ sshkey_cert_copy(const struct sshkey *from_key, struct sshkey *to_key)
 	to->valid_before = from->valid_before;
 	if (from->signature_key == NULL)
 		to->signature_key = NULL;
-	else if ((r = sshkey_from_private(from->signature_key,
+	else if ((r = sshkey_copy_public(from->signature_key,
 	    &to->signature_key)) != 0)
 		goto out;
 	if (from->signature_type != NULL &&
@@ -1724,7 +1724,7 @@ sshkey_cert_copy(const struct sshkey *from_key, struct sshkey *to_key)
 }
 
 int
-sshkey_from_private(const struct sshkey *k, struct sshkey **pkp)
+sshkey_copy_public(const struct sshkey *k, struct sshkey **pkp)
 {
 	struct sshkey *n = NULL;
 	int r = SSH_ERR_INTERNAL_ERROR;
@@ -1866,6 +1866,116 @@ sshkey_from_private(const struct sshkey *k, struct sshkey **pkp)
 
 	return r;
 }
+
+int
+sshkey_copy_private(const struct sshkey *k, struct sshkey **pvp)
+{
+	struct sshkey *n = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	*pvp = NULL;
+	switch (k->type) {
+#ifdef WITH_OPENSSL
+	case KEY_DSA:
+	case KEY_DSA_CERT:
+		if ((n = sshkey_new(k->type)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		n->dsa = k->dsa;
+		DSA_up_ref(n->dsa);
+		break;
+	case KEY_ECDSA:
+	case KEY_ECDSA_CERT:
+		if ((n = sshkey_new(k->type)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		n->ecdsa_nid = k->ecdsa_nid;
+		n->ecdsa = k->ecdsa;
+		EC_KEY_up_ref(k->ecdsa);
+		break;
+	case KEY_RSA:
+	case KEY_RSA_CERT:
+		if ((n = sshkey_new(k->type)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		n->rsa = k->rsa;
+		RSA_up_ref(k->rsa);
+		break;
+#endif /* WITH_OPENSSL */
+	case KEY_ED25519:
+	case KEY_ED25519_CERT:
+		if ((n = sshkey_new(k->type)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		if (k->ed25519_pk != NULL) {
+			if ((n->ed25519_pk = malloc(ED25519_PK_SZ)) == NULL) {
+				r = SSH_ERR_ALLOC_FAIL;
+				goto out;
+			}
+			memcpy(n->ed25519_pk, k->ed25519_pk, ED25519_PK_SZ);
+		}
+		if (k->ed25519_sk != NULL) {
+			if ((n->ed25519_sk = malloc(ED25519_SK_SZ)) == NULL) {
+				r = SSH_ERR_ALLOC_FAIL;
+				goto out;
+			}
+			memcpy(n->ed25519_sk, k->ed25519_sk, ED25519_SK_SZ);
+		}
+		break;
+#ifdef WITH_XMSS
+	case KEY_XMSS:
+	case KEY_XMSS_CERT:
+		if ((n = sshkey_new(k->type)) == NULL) {
+			r = SSH_ERR_ALLOC_FAIL;
+			goto out;
+		}
+		if ((r = sshkey_xmss_init(n, k->xmss_name)) != 0)
+			goto out;
+		if (k->xmss_pk != NULL) {
+			size_t pklen = sshkey_xmss_pklen(k);
+			if (pklen == 0 || sshkey_xmss_pklen(n) != pklen) {
+				r = SSH_ERR_INTERNAL_ERROR;
+				goto out;
+			}
+			if ((n->xmss_pk = malloc(pklen)) == NULL) {
+				r = SSH_ERR_ALLOC_FAIL;
+				goto out;
+			}
+			memcpy(n->xmss_pk, k->xmss_pk, pklen);
+		}
+		if (k->xmss_sk != NULL) {
+			size_t sklen = sshkey_xmss_sklen(k);
+			if (sklen == 0 || sshkey_xmss_sklen(n) != pklen) {
+				r = SSH_ERR_INTERNAL_ERROR;
+				goto out;
+			}
+			if ((n->xmss_sk = malloc(sklen)) == NULL) {
+				r = SSH_ERR_ALLOC_FAIL;
+				goto out;
+			}
+			memcpy(n->xmss_sk, k->xmss_sk, sklen);
+		}
+		break;
+#endif /* WITH_XMSS */
+	default:
+		r = SSH_ERR_KEY_TYPE_UNKNOWN;
+		goto out;
+	}
+	if (sshkey_is_cert(k) && (r = sshkey_cert_copy(k, n)) != 0)
+		goto out;
+	/* success */
+	*pvp = n;
+	n = NULL;
+	r = 0;
+ out:
+	sshkey_free(n);
+	return r;
+}
+
 
 static int
 cert_parse(struct sshbuf *b, struct sshkey *key, struct sshbuf *certbuf)

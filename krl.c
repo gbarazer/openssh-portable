@@ -232,7 +232,7 @@ revoked_certs_for_ca_key(struct ssh_krl *krl, const struct sshkey *ca_key,
 		return SSH_ERR_ALLOC_FAIL;
 	if (ca_key == NULL)
 		rc->ca_key = NULL;
-	else if ((r = sshkey_from_private(ca_key, &rc->ca_key)) != 0) {
+	else if ((r = sshkey_copy_public(ca_key, &rc->ca_key)) != 0) {
 		free(rc);
 		return r;
 	}
@@ -371,7 +371,7 @@ plain_key_blob(const struct sshkey *key, u_char **blob, size_t *blen)
 	struct sshkey *kcopy;
 	int r;
 
-	if ((r = sshkey_from_private(key, &kcopy)) != 0)
+	if ((r = sshkey_copy_public(key, &kcopy)) != 0)
 		return r;
 	if (sshkey_is_cert(kcopy)) {
 		if ((r = sshkey_drop_cert(kcopy)) != 0) {

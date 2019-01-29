@@ -131,6 +131,9 @@ struct idtable {
 /* private key table */
 struct idtable *idtab;
 
+/* certificates waiting for private keys */
+struct idtable *pending_certs;
+
 int max_fd = 0;
 
 /* pid of shell == parent of agent */
@@ -174,11 +177,11 @@ close_socket(SocketEntry *e)
 }
 
 static void
-idtab_init(void)
+idtable_init(struct idtable **tab)
 {
-	idtab = xcalloc(1, sizeof(*idtab));
-	TAILQ_INIT(&idtab->idlist);
-	idtab->nentries = 0;
+	*tab = xcalloc(1, sizeof(**tab));
+	TAILQ_INIT(&(*tab)->idlist);
+	(*tab)->nentries = 0;
 }
 
 static void
@@ -190,17 +193,41 @@ free_identity(Identity *id)
 	free(id);
 }
 
+static Identity *
+idtable_lookup(struct idtable *tab, struct sshkey *key, int public)
+{
+	Identity *id;
+
+	TAILQ_FOREACH(id, &tab->idlist, next) {
+		if (public) {
+			if (sshkey_equal_public(key, id->key))
+				return (id);
+		} else {
+			if (sshkey_equal(key, id->key))
+				return (id);
+		}
+	}
+	return (NULL);
+}
+
 /* return matching private key for given public key */
 static Identity *
 lookup_identity(struct sshkey *key)
 {
-	Identity *id;
+	return idtable_lookup(idtab, key, 0);
+}
 
-	TAILQ_FOREACH(id, &idtab->idlist, next) {
-		if (sshkey_equal(key, id->key))
-			return (id);
-	}
-	return (NULL);
+static Identity *
+lookup_identity_plain(struct sshkey *key)
+{
+	return idtable_lookup(idtab, key, 1);
+}
+
+/* return matching certificate key for given key */
+static Identity *
+lookup_cert(struct sshkey *key)
+{
+	return idtable_lookup(pending_certs, key, 1);
 }
 
 /* Check confirmation of keysign request */
@@ -324,6 +351,19 @@ process_sign_request2(SocketEntry *e)
 	free(signature);
 }
 
+/* Remove an entry from an idtable; NB. frees 'id' in the process */
+static void
+idtable_remove(struct idtable *tab, Identity *id)
+{
+	if (tab->nentries < 1) {
+		fatal("%s: internal error: nentries %d",
+		    __func__, tab->nentries);
+	}
+	TAILQ_REMOVE(&tab->idlist, id, next);
+	free_identity(id);
+	tab->nentries--;
+}
+
 /* shared */
 static void
 process_remove_identity(SocketEntry *e)
@@ -341,32 +381,40 @@ process_remove_identity(SocketEntry *e)
 		goto done;
 	}
 	/* We have this key, free it. */
-	if (idtab->nentries < 1)
-		fatal("%s: internal error: nentries %d",
-		    __func__, idtab->nentries);
-	TAILQ_REMOVE(&idtab->idlist, id, next);
-	free_identity(id);
-	idtab->nentries--;
-	sshkey_free(key);
+	idtable_remove(idtab, id);
+
 	success = 1;
  done:
+	/* Clobber any pending certificates that happen to match too */
+	if ((id = lookup_cert(key)) != NULL)
+		idtable_remove(pending_certs, id);
+
+	sshkey_free(key);
 	send_status(e, success);
+}
+
+static void
+idtable_clear(struct idtable *tab)
+{
+	Identity *id;
+
+	/* Loop over all identities and clear the keys. */
+	for (id = TAILQ_FIRST(&tab->idlist); id != NULL;
+	    id = TAILQ_FIRST(&tab->idlist)) {
+		TAILQ_REMOVE(&tab->idlist, id, next);
+		free_identity(id);
+	}
 }
 
 static void
 process_remove_all_identities(SocketEntry *e)
 {
-	Identity *id;
-
-	/* Loop over all identities and clear the keys. */
-	for (id = TAILQ_FIRST(&idtab->idlist); id;
-	    id = TAILQ_FIRST(&idtab->idlist)) {
-		TAILQ_REMOVE(&idtab->idlist, id, next);
-		free_identity(id);
-	}
+	idtable_clear(idtab);
+	idtable_clear(pending_certs);
 
 	/* Mark that there are no identities. */
 	idtab->nentries = 0;
+	pending_certs->nentries = 0;
 
 	/* Send success. */
 	send_status(e, 1);
@@ -398,6 +446,99 @@ reaper(void)
 		return (deadline - now);
 }
 
+static int
+promote_cert(Identity *private_id, Identity *cert)
+{
+	Identity *id;
+	struct sshkey *grafted = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	if ((r = sshkey_copy_private(private_id->key, &grafted)) != 0) {
+		error("%s: sshkey_copy_private: %s", __func__, ssh_err(r));
+		goto out;
+	}
+	if ((r = sshkey_to_certified(grafted)) != 0) {
+		error("%s: sshkey_to_certified: %s", __func__, ssh_err(r));
+		goto out;
+	}
+	if ((r = sshkey_cert_copy(cert->key, grafted)) != 0) {
+		error("%s: sshkey_cert_copy: %s", __func__, ssh_err(r));
+		goto out;
+	}
+
+	/* Check whether the grafted cert is already recorded */
+	if ((id = lookup_identity(grafted)) == NULL) {
+		debug("%s: added new %s private cert, now have %d private keys",
+		    __func__, sshkey_type(grafted), idtab->nentries);
+		id = xcalloc(1, sizeof(*id));
+		TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
+		idtab->nentries++;
+		id->key = grafted;
+		grafted = NULL; /* transfer */
+	} else {
+		debug("%s: existing %s private cert",
+		    __func__, sshkey_type(grafted));
+		/* Update the identity, as constraints may have changed */
+		free(id->comment);
+		free(id->provider);
+	}
+	id->comment = private_id->comment != NULL ?
+	    xstrdup(private_id->comment) : NULL;
+	id->provider = private_id->provider != NULL?
+	    xstrdup(private_id->provider) : NULL;
+	id->death = private_id->death;
+	id->confirm = private_id->confirm;
+
+	/* success */
+	r = 0;
+ out:
+	sshkey_free(grafted);
+	return r;
+}
+
+/* Check whether an incoming private key against the pending cert list */
+static int
+check_pending_by_key(Identity *private_id)
+{
+	Identity *cert;
+	int r;
+
+	debug3("%s: entering for %s, npending = %d", __func__,
+	    sshkey_type(private_id->key), pending_certs->nentries);
+	/* A private key could conceivable match multiple certificates */
+	while ((cert = lookup_cert(private_id->key)) != NULL) {
+		debug3("%s: found matching cert %s",
+		    __func__, sshkey_type(cert->key));
+		if ((r = promote_cert(private_id, cert)) != 0)
+			return r;
+		/* Remove the cert from the pending list */
+		idtable_remove(pending_certs, cert);
+		debug("%s: remove pending cert, now have %d pending",
+		    __func__, pending_certs->nentries);
+	}
+	return 0;
+}
+
+/* Check whether an incoming cert against the pending cert list */
+static int
+check_pending_by_cert(Identity *cert, int *matched)
+{
+	Identity *private_id;
+	int r;
+
+	*matched = 0;
+	debug3("%s: entering for %s", __func__, sshkey_type(cert->key));
+	/* A certificate should match at most one private key */
+	if ((private_id = lookup_identity_plain(cert->key)) != NULL) {
+		debug3("%s: found matching key %s",
+		    __func__, sshkey_type(private_id->key));
+		if ((r = promote_cert(private_id, cert)) != 0)
+			return r;
+		*matched = 1;
+	}
+	return 0;
+}
+
 static void
 process_add_identity(SocketEntry *e)
 {
@@ -416,6 +557,9 @@ process_add_identity(SocketEntry *e)
 		error("%s: decode private key: %s", __func__, ssh_err(r));
 		goto err;
 	}
+
+	debug3("%s: have %s key constraint len %zu", __func__,
+	    sshkey_type(k), sshbuf_len(e->request));
 
 	while (sshbuf_len(e->request)) {
 		if ((r = sshbuf_get_u8(e->request, &ctype)) != 0) {
@@ -456,7 +600,6 @@ process_add_identity(SocketEntry *e)
 		}
 	}
 
-	success = 1;
 	if (lifetime && !death)
 		death = monotime() + lifetime;
 	if ((id = lookup_identity(k)) == NULL) {
@@ -464,18 +607,83 @@ process_add_identity(SocketEntry *e)
 		TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
 		/* Increment the number of identities. */
 		idtab->nentries++;
+		debug("%s: new key, now have %d", __func__, idtab->nentries);
 	} else {
 		/* key state might have been updated */
 		sshkey_free(id->key);
 		free(id->comment);
+		debug("%s: existing key", __func__);
 	}
 	id->key = k;
 	id->comment = comment;
 	id->death = death;
 	id->confirm = confirm;
+
+	/* Can this key matriculate a pending_cert? */
+	if (!sshkey_is_cert(id->key) && check_pending_by_key(id) != 0)
+		goto send;
+
+	success = 1;
 send:
 	send_status(e, success);
 }
+
+static void
+process_add_certificates(SocketEntry *e)
+{
+	Identity *id;
+	int matched, success = 0;
+	struct sshkey *k = NULL;
+	int r = SSH_ERR_INTERNAL_ERROR;
+
+	debug3("%s: entering len = %zu", __func__, sshbuf_len(e->request));
+
+	while (sshbuf_len(e->request)) {
+		sshkey_free(k);
+		k = NULL;
+		if ((r = sshkey_froms(e->request, &k)) != 0) {
+			error("%s: buffer error: %s", __func__, ssh_err(r));
+			goto send;
+		}
+		debug2("%s: key type %s", __func__, sshkey_type(k));
+		if (!sshkey_is_cert(k)) {
+			error("%s: key is not a certificate", __func__);
+			goto send;
+		}
+		if ((id = lookup_identity(k)) != NULL) {
+			debug("%s: cert already has key", __func__);
+		} else if ((id = lookup_cert(k)) != NULL) {
+			debug("%s: cert already enqueued", __func__);
+			if ((r = check_pending_by_cert(id, &matched)) != 0)
+				goto send;
+			if (matched) {
+				debug("%s: cert matches, remove from pending",
+				    __func__);
+				idtable_remove(pending_certs, id);
+			}
+		} else {
+			id = xcalloc(1, sizeof(Identity));
+			id->key = k;
+			k = NULL; /* transfer */
+			if ((r = check_pending_by_cert(id, &matched)) != 0)
+				goto send;
+			if (matched)
+				free_identity(id);
+			else {
+				TAILQ_INSERT_TAIL(&pending_certs->idlist,
+				    id, next);
+				pending_certs->nentries++;
+				debug("%s: add cert, nentries %d",
+				    __func__, pending_certs->nentries);
+			}
+		}
+	}
+	success = 1;
+send:
+	sshkey_free(k);
+	send_status(e, success);
+}
+
 
 /* XXX todo: encrypt sensitive data with passphrase */
 static void
@@ -554,7 +762,7 @@ process_add_smartcard_key(SocketEntry *e)
 	u_int seconds;
 	time_t death = 0;
 	u_char type;
-	struct sshkey **keys = NULL, *k;
+	struct sshkey **keys = NULL;
 	Identity *id;
 
 	if ((r = sshbuf_get_cstring(e->request, &provider, NULL)) != 0 ||
@@ -601,25 +809,29 @@ process_add_smartcard_key(SocketEntry *e)
 
 	count = pkcs11_add_provider(canonical_provider, pin, &keys);
 	for (i = 0; i < count; i++) {
-		k = keys[i];
-		if (lookup_identity(k) == NULL) {
+		if ((id = lookup_identity(keys[i])) == NULL) {
 			id = xcalloc(1, sizeof(Identity));
-			id->key = k;
 			id->provider = xstrdup(canonical_provider);
 			id->comment = xstrdup(canonical_provider); /* XXX */
 			id->death = death;
 			id->confirm = confirm;
+			id->key = keys[i];
+			keys[i] = NULL; /* transfer */
 			TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
 			idtab->nentries++;
-			success = 1;
-		} else {
-			sshkey_free(k);
 		}
-		keys[i] = NULL;
+		/* Can this key matriculate a pending_cert? */
+		if (!sshkey_is_cert(id->key) && check_pending_by_key(id) != 0) {
+			success = 0;
+			goto send;
+		}
+		success = 1;
 	}
 send:
 	free(pin);
 	free(provider);
+	for (i = 0; i < count; i++)
+		sshkey_free(keys[i]);
 	free(keys);
 	send_status(e, success);
 }
@@ -758,6 +970,9 @@ process_message(u_int socknum)
 		process_remove_smartcard_key(e);
 		break;
 #endif /* ENABLE_PKCS11 */
+	case SSH2_AGENTC_ADD_CERTIFICATES:
+		process_add_certificates(e);
+		break;
 	default:
 		/* Unknown message.  Respond with failure. */
 		error("Unknown message %d", type);
@@ -1311,7 +1526,8 @@ skip:
 	new_socket(AUTH_SOCKET, sock);
 	if (ac > 0)
 		parent_alive_interval = 10;
-	idtab_init();
+	idtable_init(&idtab);
+	idtable_init(&pending_certs);
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGINT, (d_flag | D_flag) ? cleanup_handler : SIG_IGN);
 	signal(SIGHUP, cleanup_handler);

@@ -64,6 +64,7 @@
 #include "misc.h"
 #include "ssherr.h"
 #include "digest.h"
+#include "authfile.h"
 
 /* argv0 */
 extern char *__progname;
@@ -346,7 +347,7 @@ add_file(int agent_fd, const char *filename, int key_only, int qflag)
 		    certpath, filename);
 		sshkey_free(cert);
 		goto out;
-	} 
+	}
 
 	/* Graft with private bits */
 	if ((r = sshkey_to_certified(private)) != 0) {
@@ -385,6 +386,42 @@ add_file(int agent_fd, const char *filename, int key_only, int qflag)
 	free(certpath);
 	free(comment);
 	sshkey_free(private);
+
+	return ret;
+}
+
+static int
+add_cert(int agent_fd, const char *filename, int qflag)
+{
+	struct sshkey *cert = NULL;
+	char *comment = NULL;
+	int r, ret = -1;
+
+	if ((r = sshkey_load_public(filename, &cert, &comment)) != 0) {
+		if (r == SSH_ERR_INVALID_FORMAT)
+			return 0; /* ignore; probably a private key */
+		fprintf(stderr, "Error loading key \"%s\": %s\n",
+		    filename, ssh_err(r));
+		return -1;
+	}
+	if (!sshkey_is_cert(cert)) {
+		debug("%s: key %s is not a cert", __func__, sshkey_type(cert));
+		ret = 0; /* not an error */
+		goto out;
+	}
+	ret = 1;
+	if ((r = ssh_add_certificate(agent_fd, cert)) == 0) {
+		if (!qflag) {
+			fprintf(stderr, "Certificate added pending "
+			    "private key load: %s (%s)\n", filename, comment);
+		}
+	} else {
+		fprintf(stderr, "Could not add certificate \"%s\": %s\n",
+		    filename, ssh_err(r));
+	}
+ out:
+	sshkey_free(cert);
+	free(comment);
 
 	return ret;
 }
@@ -493,14 +530,41 @@ lock_agent(int agent_fd, int lock)
 }
 
 static int
-do_file(int agent_fd, int deleting, int key_only, char *file, int qflag)
+do_files(int agent_fd, int deleting, int key_only, int qflag,
+    char **files, size_t nfiles)
 {
+	size_t i;
+	int r;
+
 	if (deleting) {
-		if (delete_file(agent_fd, file, key_only, qflag) == -1)
-			return -1;
+		for (i = 0; i < nfiles; i++) {
+			if (delete_file(agent_fd, files[i],
+			    key_only, qflag) == -1)
+				return -1;
+		}
 	} else {
-		if (add_file(agent_fd, file, key_only, qflag) == -1)
-			return -1;
+		/*
+		 * Load plain certificates first, so they are there ready for
+		 * private keys to find them.
+		 */
+		for (i = 0; !key_only && i < nfiles; i++) {
+			if (strcmp(files[i], "-") == 0)
+				continue;
+			if ((r = add_cert(agent_fd, files[i], qflag)) == -1)
+				return -1;
+			else if (r == 1) {
+				/* consume file */
+				free(files[i]);
+				files[i] = NULL;
+			}
+		}
+		for (i = 0; i < nfiles; i++) {
+			if (files[i] == NULL)
+				continue;
+			if (add_file(agent_fd, files[i],
+			    key_only, qflag) == -1)
+				return -1;
+		}
 	}
 	return 0;
 }
@@ -532,9 +596,9 @@ main(int argc, char **argv)
 {
 	extern char *optarg;
 	extern int optind;
-	int agent_fd;
-	char *pkcs11provider = NULL;
-	int r, i, ch, deleting = 0, ret = 0, key_only = 0;
+	char *pkcs11provider = NULL, **files = NULL;
+	size_t j, nfiles = 0;
+	int i, agent_fd, r, ch, deleting = 0, ret = 0, key_only = 0;
 	int xflag = 0, lflag = 0, Dflag = 0, qflag = 0;
 
 	ssh_malloc_init();	/* must be called before any mallocs */
@@ -658,11 +722,10 @@ main(int argc, char **argv)
 			ret = 1;
 		goto done;
 	}
-	if (argc == 0) {
-		char buf[PATH_MAX];
+	if (argc <= 0) {
+		char *cp;
 		struct passwd *pw;
 		struct stat st;
-		int count = 0;
 
 		if ((pw = getpwuid(getuid())) == NULL) {
 			fprintf(stderr, "No user found with uid %u\n",
@@ -671,28 +734,30 @@ main(int argc, char **argv)
 			goto done;
 		}
 
-		for (i = 0; default_files[i]; i++) {
-			snprintf(buf, sizeof(buf), "%s/%s", pw->pw_dir,
-			    default_files[i]);
-			if (stat(buf, &st) < 0)
+		for (j = 0; default_files[j]; j++) {
+			xasprintf(&cp, "%s/%s", pw->pw_dir, default_files[j]);
+			if (stat(cp, &st) < 0) {
+				free(cp);
 				continue;
-			if (do_file(agent_fd, deleting, key_only, buf,
-			    qflag) == -1)
-				ret = 1;
-			else
-				count++;
+			}
+			files = xrecallocarray(files, nfiles, nfiles + 1,
+			    sizeof(*files));
+			files[nfiles++] = cp;
 		}
-		if (count == 0)
-			ret = 1;
 	} else {
-		for (i = 0; i < argc; i++) {
-			if (do_file(agent_fd, deleting, key_only,
-			    argv[i], qflag) == -1)
-				ret = 1;
-		}
+		/* Copy argv as we need to modify the list later */
+		nfiles = (size_t)argc;
+		files = xcalloc(nfiles, sizeof(*files));
+		for (j = 0; j < nfiles; j++)
+			files[j] = xstrdup(argv[j]);
 	}
+	if (nfiles == 0 ||
+	    do_files(agent_fd, deleting, key_only, qflag, files, nfiles) == -1)
+		ret = 1;
+	for (j = 0; j < nfiles; j++)
+		free(files[j]);
+	free(files);
 	clear_pass();
-
 done:
 	ssh_close_authentication_socket(agent_fd);
 	return ret;

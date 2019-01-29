@@ -473,6 +473,31 @@ ssh_add_identity_constrained(int sock, const struct sshkey *key,
 }
 
 /*
+ * Adds a cert to the authentication server that may be later joined with a
+ * private key.
+ * This call is intended only for use by ssh-add(1) and like applications.
+ */
+int
+ssh_add_certificate(int sock, const struct sshkey *cert)
+{
+	struct sshbuf *msg;
+	int r;
+	u_char type = 0;
+
+	if ((msg = sshbuf_new()) == NULL)
+		return SSH_ERR_ALLOC_FAIL;
+	if ((r = sshbuf_put_u8(msg, SSH2_AGENTC_ADD_CERTIFICATES)) != 0 ||
+	    (r = sshkey_puts(cert, msg)) != 0 ||
+	    (r = ssh_request_reply(sock, msg, msg)) != 0 ||
+	    (r = sshbuf_get_u8(msg, &type)) != 0)
+		goto out;
+	r = decode_reply(type);
+ out:
+	sshbuf_free(msg);
+	return r;
+}
+
+/*
  * Removes an identity from the authentication server.
  * This call is intended only for use by ssh-add(1) and like applications.
  */
